@@ -1,6 +1,7 @@
 ultralytics
 fastapi
 uvicorn
+gunicorn
 python-multipart
 opencv-contrib-python
 numpy
