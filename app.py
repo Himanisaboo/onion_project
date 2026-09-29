@@ -11,6 +11,9 @@ os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 import cv2
 import numpy as np
 import tempfile
+import torch
+
+torch.set_num_threads(1)
 
 from PIL import Image
 from ultralytics import YOLO, SAM
@@ -356,6 +359,7 @@ def home():
     }
 
 
+@torch.inference_mode()
 def process_image(
     image_path,
     standard_id="local_market"
