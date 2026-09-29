@@ -1,4 +1,13 @@
 import os
+import gc
+
+# Keep CPU threading conservative on small Render instances.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+
 import cv2
 import numpy as np
 import tempfile
@@ -10,8 +19,24 @@ from fastapi import FastAPI, UploadFile, File
 YOLO_MODEL_PATH = "best.pt"
 SAM_MODEL_PATH = "sam2.1_b.pt"
 
-detector = YOLO(YOLO_MODEL_PATH)
-sam = SAM(SAM_MODEL_PATH)
+# Models are loaded lazily to reduce Render startup RAM usage.
+# They are cached after the first request so they are not reloaded for every image.
+_detector = None
+_sam = None
+
+
+def get_detector():
+    global _detector
+    if _detector is None:
+        _detector = YOLO(YOLO_MODEL_PATH)
+    return _detector
+
+
+def get_sam():
+    global _sam
+    if _sam is None:
+        _sam = SAM(SAM_MODEL_PATH)
+    return _sam
 
 REFERENCE_SIZE_MM = 50
 
@@ -330,13 +355,20 @@ def process_image(
         return None, None, "Could not read image."
 
     # 1. YOLO DETECTION
+    detector = get_detector()
+
     detections = detector.predict(
         source=image_path,
         conf=0.25,
-        verbose=False
+        verbose=False,
+        device="cpu"
     )[0]
 
+    # Create the annotated image while YOLO results are still available.
+    annotated = Image.fromarray(detections.plot())
+
     onion_boxes = []
+    defect_detections = []
 
     for box in detections.boxes:
         class_id = int(box.cls[0])
@@ -346,9 +378,21 @@ def process_image(
             onion_boxes.append(
                 box.xyxy[0].cpu().numpy().tolist()
             )
+        else:
+            defect_detections.append({
+                "class_name": class_name,
+                "box": box.xyxy[0].cpu().numpy().tolist()
+            })
 
     if len(onion_boxes) == 0:
         return None, None, "No onions detected by YOLO."
+
+    # YOLO is no longer needed after boxes/class names are extracted.
+    # Release it before loading SAM2 to keep peak RAM lower on small instances.
+    global _detector
+    _detector = None
+    del detector
+    gc.collect()
 
     # 2. ARUCO CALIBRATION
     marker_pixels = detect_reference_marker(image)
@@ -365,10 +409,13 @@ def process_image(
     )
 
     # 3. SAM2 SEGMENTATION
+    sam = get_sam()
+
     sam_results = sam(
         image_path,
         bboxes=onion_boxes,
-        verbose=False
+        verbose=False,
+        device="cpu"
     )
 
     sam_result = sam_results[0]
@@ -383,6 +430,13 @@ def process_image(
         .cpu()
         .numpy()
     )
+
+    # SAM2 is no longer needed after masks are copied to NumPy.
+    # Release the model before the remaining CPU-side processing.
+    global _sam
+    _sam = None
+    del sam
+    gc.collect()
 
     # 4. ONION MEASUREMENTS
     records = []
@@ -427,19 +481,9 @@ def process_image(
         if valid_mask_index >= len(records):
             continue
 
-        for box in detections.boxes:
-            class_id = int(box.cls[0])
-            class_name = detector.names[class_id]
-
-            if class_name == "onion":
-                continue
-
-            defect_box = (
-                box.xyxy[0]
-                .cpu()
-                .numpy()
-                .tolist()
-            )
+        for defect in defect_detections:
+            class_name = defect["class_name"]
+            defect_box = defect["box"]
 
             cx, cy = box_center(defect_box)
 
@@ -516,12 +560,12 @@ def process_image(
         ]
     }
 
-    # 11. ANNOTATED IMAGE
-    annotated = detections.plot()
-
-    annotated = Image.fromarray(
-        annotated
-    )
+    # Release temporary inference results before returning.
+    del sam_results
+    del sam_result
+    del masks
+    del detections
+    del defect_detections
 
     return annotated, result_data, report
 
