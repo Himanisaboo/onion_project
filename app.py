@@ -38,6 +38,7 @@ def get_sam():
         _sam = SAM(SAM_MODEL_PATH)
     return _sam
 
+
 REFERENCE_SIZE_MM = 50
 
 
@@ -128,10 +129,13 @@ def point_inside_mask(x, y, mask):
     if y < 0 or y >= h:
         return False
 
-    return bool(mask[y, x])
+    return bool(mask[y, x] > 0.5)
 
 
 def local_market_size(diameter_mm):
+    if diameter_mm is None:
+        return "Not measured"
+
     if diameter_mm > 60:
         return "Extra Large"
 
@@ -216,7 +220,9 @@ def apply_rules(records, standard_id):
     for record in records:
         diameter = record["diameter_mm"]
 
-        if "minimum_diameter_mm" in standard:
+        if diameter is None:
+            size_status = "Not measured"
+        elif "minimum_diameter_mm" in standard:
             if diameter < standard["minimum_diameter_mm"]:
                 size_status = "Below minimum"
             else:
@@ -304,11 +310,16 @@ def generate_report(records, standard_id):
 """
 
     for onion in graded:
+        dia_str = (
+            f"{onion['diameter_mm']} mm"
+            if onion["diameter_mm"] is not None
+            else "Not measured"
+        )
         report += f"""
 
 ### Onion {onion["onion_id"]}
 
-- Diameter: **{onion["diameter_mm"]} mm**
+- Diameter: **{dia_str}**
 - Size result: **{onion["size_status"]}**
 - Condition: **{onion["condition"]}**
 - Defects: **{", ".join(onion["defects"]) if onion["defects"] else "None detected"}**
@@ -372,41 +383,45 @@ def process_image(
 
     for box in detections.boxes:
         class_id = int(box.cls[0])
-        class_name = detector.names[class_id]
+        raw_class_name = detector.names[class_id]
+        norm_name = str(raw_class_name).strip().lower().replace("-", "_")
 
-        if class_name == "onion":
+        if norm_name in ["onion", "onions"]:
             onion_boxes.append(
                 box.xyxy[0].cpu().numpy().tolist()
             )
         else:
+            if norm_name in ["rotten", "spoiled", "rot", "rotten_onion"]:
+                canonical_class = "rotten"
+            elif norm_name in ["sprout", "sprouted", "sprouting"]:
+                canonical_class = "sprout"
+            elif norm_name in ["double_split", "double split", "split", "double"]:
+                canonical_class = "double_split"
+            else:
+                canonical_class = norm_name
+
             defect_detections.append({
-                "class_name": class_name,
+                "class_name": canonical_class,
                 "box": box.xyxy[0].cpu().numpy().tolist()
             })
 
     if len(onion_boxes) == 0:
         return None, None, "No onions detected by YOLO."
 
-    # YOLO is no longer needed after boxes/class names are extracted.
-    # Release it before loading SAM2 to keep peak RAM lower on small instances.
+    # YOLO cleanup
     global _detector
     _detector = None
     del detector
     gc.collect()
 
-    # 2. ARUCO CALIBRATION
+    # 2. ARUCO CALIBRATION (OPTIONAL)
     marker_pixels = detect_reference_marker(image)
 
-    if marker_pixels is None:
-        return None, None, (
-            "Reference marker not detected. "
-            "Place the 50 mm ArUco reference marker "
-            "with marker ID 23 in the image."
-        )
-
-    mm_per_pixel = (
-        REFERENCE_SIZE_MM / marker_pixels
-    )
+    if marker_pixels is not None and marker_pixels > 0:
+        mm_per_pixel = REFERENCE_SIZE_MM / marker_pixels
+    else:
+        marker_pixels = None
+        mm_per_pixel = None
 
     # 3. SAM2 SEGMENTATION
     sam = get_sam()
@@ -431,8 +446,7 @@ def process_image(
         .numpy()
     )
 
-    # SAM2 is no longer needed after masks are copied to NumPy.
-    # Release the model before the remaining CPU-side processing.
+    # SAM cleanup
     global _sam
     _sam = None
     del sam
@@ -440,6 +454,7 @@ def process_image(
 
     # 4. ONION MEASUREMENTS
     records = []
+    valid_masks = []
 
     for i, mask in enumerate(masks):
         measurement = measure_mask(mask)
@@ -447,21 +462,25 @@ def process_image(
         if measurement is None:
             continue
 
-        diameter_mm = (
-            measurement["diameter_pixels"]
-            * mm_per_pixel
-        )
+        if mm_per_pixel is not None:
+            diameter_mm = round(
+                measurement["diameter_pixels"] * mm_per_pixel,
+                2
+            )
+            size_cat = local_market_size(diameter_mm)
+        else:
+            diameter_mm = None
+            size_cat = "Not measured"
 
         records.append({
             "onion_id": len(records) + 1,
-            "diameter_mm": round(diameter_mm, 2),
-            "size_category": local_market_size(
-                diameter_mm
-            ),
+            "diameter_mm": diameter_mm,
+            "size_category": size_cat,
             "rotten": False,
             "sprout": False,
             "double_split": False
         })
+        valid_masks.append(mask)
 
     if len(records) == 0:
         return None, None, (
@@ -470,44 +489,20 @@ def process_image(
         )
 
     # 5. DEFECT ASSOCIATION
-    valid_mask_index = 0
-
-    for mask in masks:
-        measurement = measure_mask(mask)
-
-        if measurement is None:
-            continue
-
-        if valid_mask_index >= len(records):
-            continue
-
+    for record, mask in zip(records, valid_masks):
         for defect in defect_detections:
             class_name = defect["class_name"]
             defect_box = defect["box"]
 
             cx, cy = box_center(defect_box)
 
-            if point_inside_mask(
-                cx,
-                cy,
-                mask
-            ):
+            if point_inside_mask(cx, cy, mask):
                 if class_name == "rotten":
-                    records[
-                        valid_mask_index
-                    ]["rotten"] = True
-
+                    record["rotten"] = True
                 elif class_name == "sprout":
-                    records[
-                        valid_mask_index
-                    ]["sprout"] = True
-
+                    record["sprout"] = True
                 elif class_name == "double_split":
-                    records[
-                        valid_mask_index
-                    ]["double_split"] = True
-
-        valid_mask_index += 1
+                    record["double_split"] = True
 
     # 6. CONDITION
     for record in records:
@@ -540,13 +535,15 @@ def process_image(
         "standard": standard_id,
         "calibration": {
             "reference_size_mm": REFERENCE_SIZE_MM,
-            "marker_pixels": round(
-                marker_pixels,
-                2
+            "marker_pixels": (
+                round(marker_pixels, 2)
+                if marker_pixels is not None
+                else None
             ),
-            "mm_per_pixel": round(
-                mm_per_pixel,
-                4
+            "mm_per_pixel": (
+                round(mm_per_pixel, 4)
+                if mm_per_pixel is not None
+                else None
             )
         },
         "lot_summary": lot_statistics,
